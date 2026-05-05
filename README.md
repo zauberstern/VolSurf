@@ -1,18 +1,9 @@
-<table border="0" cellpadding="0" cellspacing="0">
-<tr>
-<td><img src="volsurf_logo.png" width="500" alt="VolSurf"/></td>
-<td>&nbsp;&nbsp;&nbsp;</td>
-<td>
-
-## VolSurf
-**Friction-aware alpha generation with Deep Reinforcement Learning**
-
-
-</td>
-</tr>
-</table>
-
-Trains a deep reinforcement learning policy on a synthetic volatility surface environment and evaluates alpha out-of-sample against a four-factor attribution model.
+<div align="center">
+  <img src="volsurf_logo.png" width="160" alt="VolSurf"/>
+  <h1>VolSurf</h1>
+  <p><em>Friction-aware alpha generation with Deep Reinforcement Learning</em></p>
+  <p>Trains a deep reinforcement learning policy on a synthetic volatility surface environment<br>and evaluates alpha out-of-sample against a four-factor attribution model.</p>
+</div>
 
 ---
 
