@@ -1,0 +1,269 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Friction-Aware Alpha Generation Framework — Master Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# This file is the single source of truth for every tunable parameter in the
+# framework.  All run_*.py scripts and src/ modules read from here via
+# src/config.py, which additionally accepts PIPELINE_* environment-variable
+# overrides (env vars take precedence over YAML values).
+#
+# Env-var override map:
+#   PIPELINE_DATA_START    → data.start
+#   PIPELINE_DATA_END      → data.end
+#   PIPELINE_INSAMPLE_END  → data.insample_end
+#   PIPELINE_OOS_END       → data.oos_end
+#   PIPELINE_N_EPOCHS      → training.n_epochs
+#   PIPELINE_K             → portfolio.K
+#   PIPELINE_TC            → training.transaction_cost
+#   PIPELINE_TC_BPS        → portfolio.transaction_cost_bps
+#   PIPELINE_CVAR_ALPHA    → cvar.alpha
+#   PIPELINE_RESULTS_TAG   → paths.results_tag
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA WINDOW
+# ─────────────────────────────────────────────────────────────────────────────
+data:
+  start:        "2003-01-01"   # PIPELINE_DATA_START  (full CRSP CSV coverage)
+  end:          "2024-12-31"   # PIPELINE_DATA_END
+  insample_end: "2021-12-31"   # PIPELINE_INSAMPLE_END  — IS/OOS split point
+  oos_end:      null            # null → same as data.end; PIPELINE_OOS_END
+  purge_days:   91              # 91-day embargo between IS end and OOS start
+                                # (91-day IV term structure contains overlapping settlement windows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PORTFOLIO
+# ─────────────────────────────────────────────────────────────────────────────
+portfolio:
+  K: 20                         # number of S&P 500 constituents; PIPELINE_K
+  # Round-trip TC in basis points used by run_portfolio.py cross-sectional
+  # backtest.  Separate from training.transaction_cost (which is a fraction).
+  transaction_cost_bps: 1.0     # PIPELINE_TC_BPS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIMULATION  (Phase II — VECM engine + MBB fallback)
+# ─────────────────────────────────────────────────────────────────────────────
+simulation:
+  n_paths:           20000      # Monte-Carlo paths per training epoch
+  n_steps:           252        # forecast horizon (trading days ≈ 1 year)
+  johansen_alpha:    0.05       # Johansen trace test significance level
+  bootstrap_block:   63         # MBB block size in trading days; T^(1/3) ≈ 63 for T≈4700 IS days
+
+  # SSVI / Lee (2004) arbitrage-free bounds applied to IV columns
+  ssvi:
+    iv_min:           0.01      # Lee lower bound (1% ATM IV floor)
+    iv_max:           3.0       # Lee upper bound (300% ATM IV ceiling)
+    tenor_short_days: 30        # short-maturity tenor (calendar days)
+    tenor_long_days:  91        # long-maturity tenor  (calendar days)
+
+  # L-BFGS-B solver settings for project_surface_ssvi
+  ssvi_solver:
+    maxiter: 500
+    ftol:    1.0e-6   # L-BFGS-B tolerance; tighter values cause NaN on ill-conditioned surfaces
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ECONOMETRIC GATING  (Phase I — Benjamini-Yekutieli FDR)
+# ─────────────────────────────────────────────────────────────────────────────
+gating:
+  alpha:                0.05    # family-wise significance level
+  # HAC Newey-West lag truncation: null → floor(4·(T/100)^(2/9))
+  n_lags:               null
+  # ATM half-spread fallback (fraction of underlying) when OptionMetrics
+  # opprcd table is unavailable.
+  # Literature: Muravyev & Pearson RFS 2020 ≈ 25 bps for SPX ATM options.
+  half_spread_fallback: 0.0025  # 25 bps expressed as fraction of underlying
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL ARCHITECTURE  (Phase III — GRU-64 Actor-Critic)
+# ─────────────────────────────────────────────────────────────────────────────
+model:
+  hidden_size:  64              # GRU hidden units (fixed per spec)
+  # Gaussian policy log-std clamping
+  log_std_min: -4.0
+  log_std_max:  0.0
+  # Numerical stability epsilon in simplex log-prob (below float32 eps)
+  softmax_eps:  1.0e-6
+  # Zang smoothing resolution for CVaR ReLU approximation
+  zang_eps:     1.0e-2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAINING  (Phase III — PPO + Lagrangian CVaR)
+# ─────────────────────────────────────────────────────────────────────────────
+training:
+  n_epochs:       150           # PPO outer epochs; PIPELINE_N_EPOCHS
+  n_ppo_updates:  10            # PPO inner update passes per outer epoch
+  mini_batch:     5000          # paths per gradient step; ≥1/α tail obs required (5000×0.05=250)
+
+  # Adam optimiser
+  lr:             1.0e-3
+
+  # Generalised Advantage Estimation
+  gamma:          0.99          # discount factor
+  gae_lambda:     0.95          # GAE smoothing parameter λ
+
+  # PPO clipped surrogate
+  ppo_clip_eps:   0.08          # PPO ε; [0.05, 0.10] is typical for continuous-action policies
+  entropy_coef:   0.005         # c_ent — entropy bonus coefficient (initial value)
+  entropy_decay:  0.966         # per-epoch decay; floor hit at ≈90% of n_epochs
+                                # decay = (C_ENT_FLOOR/C_ENT_0)^(1/(0.9×150)) ≈ 0.966
+  entropy_floor:  5.0e-5        # minimum entropy coefficient
+
+  # ── Beta-neutralization penalty ──
+  # reward_t += -beta_penalty * r_mkt_t  where r_mkt_t = equal-weight constituent return
+  # Setting beta_penalty=1.0 forces the agent to optimize EXCESS return over the market
+  # rather than raw return (which degenerates to leveraged long-only indexing).
+  beta_penalty:   1.0           # coefficient on market return subtraction (1.0 = fully beta-neutral)
+
+  # Gradient safety
+  grad_norm_abort: 10.0         # abort gradient update if pre-clip L2 norm exceeds this
+  grad_clip_max:   5.0          # clip accepted updates to this max L2 norm
+
+  # Almgren-Chriss friction reward
+  # r_t = Σ_k w_k·r_k - Σ_k a_tc_k·|Δw_k| - Σ_k a_imp_k·|Δw_k|^(1+β)
+  # Per-stock a_tc_k is derived from CRSP BID/ASK: (ASK-BID)/(2·PRC) × spread_eff_factor
+  # Per-stock a_imp_k = impact_coef × (portfolio_nav / ADV_k)^impact_beta
+  # The scalar transaction_cost is the fallback when CRSP spread data is unavailable.
+  transaction_cost: 1.0e-4      # fallback uniform half-spread; PIPELINE_TC
+  impact_coef:      5.0e-4      # a_imp base — Almgren-Chriss temporary impact coefficient
+  impact_beta:      0.6         # β — power-law exponent (impact ∝ |Δw|^{1+β} = |Δw|^1.6)
+  # VIX-regime-conditional Glosten-Harris effective/quoted spread ratio.
+  # Petersen & Fialkowski (1994 JFE): large-cap NYSE effective ≈ 50–55% of quoted.
+  # Ratio narrows in crises (adverse selection spikes, maker inventory risk rises).
+  spread_eff_factor_low:  0.55   # VIX ≤ spread_eff_vix_low  (calm regime)
+  spread_eff_factor_mid:  0.50   # VIX ≤ spread_eff_vix_high (normal regime)
+  spread_eff_factor_high: 0.45   # VIX > spread_eff_vix_high (stress / crisis)
+  spread_eff_vix_low:     0.20   # 20 VIX points in decimal — low/mid boundary
+  spread_eff_vix_high:    0.30   # 30 VIX points in decimal — mid/high boundary
+  # Assumed portfolio NAV (USD) for ADV-normalised Almgren-Chriss impact.
+  # At $10M notional, participation rate = Δw × 10M / ADV_k ≪ 1 for S&P 500 names.
+  portfolio_nav:    1.0e7       # $10 million
+
+  # Checkpoint saving
+  checkpoint_every: 10          # save policy_weights_ep{N:03d}.pt every N epochs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CVaR  (Lagrangian dualization with Zang smoothing)
+# ─────────────────────────────────────────────────────────────────────────────
+cvar:
+  alpha:     0.05               # tail risk level α (5th-percentile loss); PIPELINE_CVAR_ALPHA
+  c_bar:     0.0                # CVaR budget constraint threshold
+  dual_step: 1.0e-3             # γ — dual variable (η) gradient ascent step size
+  rho:       1.0                # Augmented Lagrangian quadratic penalty coefficient
+                                # ALaM: L = η×violation + (ρ/2)×max(0,violation)^2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVALUATION  (Phase IV — OOS metrics)
+# ─────────────────────────────────────────────────────────────────────────────
+evaluation:
+  # Risk aversion coefficient (used in Whalley-Wilmott no-trade zone formula)
+  risk_aversion:       2.0
+
+  # Approximate ATM option gamma for W-W no-trade zone computation
+  ww_gamma_atm:        0.02
+
+  # Attribution regression HAC lag truncation: null → floor(T^(1/3))
+  attribution_n_lags:  null
+
+  # Monte-Carlo block-bootstrap permutation p-value
+  mc_n_trials:         1000
+  mc_seed:             42
+  mc_block_size:       null     # null → floor(T^(1/3))
+
+  # Deflated Sharpe Ratio (Bailey & López de Prado 2014)
+  dsr_n_trials:        1        # number of strategy candidates evaluated
+
+  # 3D policy transparency surface grid resolution (grid_size × grid_size)
+  policy_surface_grid: 40
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CROSS-SECTIONAL SIGNALS  (run_portfolio.py — Phase IV backtest)
+# ─────────────────────────────────────────────────────────────────────────────
+signals:
+  rv_window_short:  21          # short realized variance window (trading days)
+  rv_window_long:   63          # long realized variance window  (trading days)
+  mom_lookback:     252         # 12-month momentum lookback     (trading days)
+  mom_exclusion:    21          # 1-month near-term exclusion    (trading days)
+  top_quantile:     0.75        # quantile cut-off for signal-ranked portfolios
+  # ── New enrichment signals (from local CSV exports) ───────────────────────
+  include_cross_vol_spread: true  # log(VXN/VIX) + log(VXD/VIX); requires
+                                  # data/cboe_vix_vox_2003_2024.csv
+  include_rv_dispersion: true     # cross-sectional CV of 30d constituent HV;
+                                  # requires data/sp500_historical_vol_*.csv
+                                  # (large file — set false to skip on cold runs)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS  (file system)
+# ─────────────────────────────────────────────────────────────────────────────
+paths:
+  cache_dir:   "data/wrds_cache"   # WRDS parquet cache + model weights
+  figures_dir: "data/figures"      # saved plot output
+  results_tag: ""                   # suffix for rl_oos_results{tag}.* files;
+                                    # set per ablation/WFO run; PIPELINE_RESULTS_TAG
+
+  # ── Raw OptionMetrics per-constituent option prices (35 GB, 2023-2024) ────
+  # Despite the filename, the actual option data covers 2023-2024 only.
+  # The "2003-2024" suffix refers to the S&P 500 universe membership period.
+  # Used by src/econometrics/constituent_options.py to compute iv_dispersion_raw,
+  # mean_constituent_iv, mean_constituent_skew, and constituent_ba_spread.
+  # Set to null to skip constituent option enrichment on machines without the file.
+  constituent_options_csv: "D:/Downloads/option_prices_2003-2024_sp500_all_constituents.csv"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ABLATION GRID  (run_ablation.py — Phase 1 of ROADMAP.md)
+# ─────────────────────────────────────────────────────────────────────────────
+ablation:
+  cvar_alphas: [1.0, 0.25, 0.05]           # tail level grid
+  tc_values:   [0.0, 1.0e-5, 1.0e-4, 1.0e-3]  # transaction cost grid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WALK-FORWARD WINDOWS  (run_wfo.py — Phase 2 of ROADMAP.md)
+# ─────────────────────────────────────────────────────────────────────────────
+wfo:
+  # Fixed data anchor for all WFO windows (WRDS cache covers this range)
+  data_start: "2003-01-01"
+
+  # CAUSAL INTEGRITY: set this to the date on which config.yaml hyperparameters
+  # were last modified.  run_wfo.py will abort if this date falls AFTER the
+  # earliest IS-end date (2018-12-31), preventing hyperparameter leakage.
+  # Format: "YYYY-MM-DD".  Set to null to disable the guard.
+  hp_freeze_date: "2025-12-31"   # frozen prior to any WFO evaluation
+
+  # Expanding IS windows; each year evaluated as its own OOS test.
+  # Window w4_2022 is the primary published result (aligned with main pipeline).
+  windows:
+    - label:        "w1_2019"
+      insample_end: "2018-12-31"
+      oos_end:      "2019-12-31"
+      primary:      false
+    - label:        "w2_2020"
+      insample_end: "2019-12-31"
+      oos_end:      "2020-12-31"
+      primary:      false
+    - label:        "w3_2021"
+      insample_end: "2020-12-31"
+      oos_end:      "2021-12-31"
+      primary:      false
+    - label:        "w4_2022"
+      insample_end: "2021-12-31"
+      oos_end:      "2022-12-31"
+      primary:      true          # primary published result
+    - label:        "w5_2023"
+      insample_end: "2022-12-31"
+      oos_end:      "2023-12-31"
+      primary:      false
+    - label:        "w6_2024"
+      insample_end: "2023-12-31"
+      oos_end:      "2024-12-31"
+      primary:      false
